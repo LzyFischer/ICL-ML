@@ -1,0 +1,12 @@
+torch>=2.1
+transformers>=4.56
+datasets>=2.18
+accelerate>=0.27
+numpy
+pandas
+matplotlib
+tqdm
+# optional: API backend (OpenAI / vLLM server / Together / DeepSeek ...)
+openai>=1.0
+# dev
+pytest
