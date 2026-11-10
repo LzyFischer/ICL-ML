@@ -1,7 +1,7 @@
 """End-to-end smoke tests that run fully offline (no HF Hub access needed).
 
 A tiny randomly-initialised GPT-2 and a locally trained BPE tokenizer stand in
-for a real model, and the synthetic tasks stand in for SST-2 / GSM8K.
+for a real model, and the synthetic tasks stand in for the real datasets.
 Accuracy is meaningless here; we test that every code path runs and that the
 outputs have the right shape.
 """
@@ -16,7 +16,6 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from icl import prompts as P  # noqa: E402
-from icl.metrics import extract_number, match_label, numbers_equal  # noqa: E402
 from icl.tasks import load_task  # noqa: E402
 
 
@@ -27,11 +26,11 @@ def tiny_model_dir(tmp_path_factory):
 
     d = tmp_path_factory.mktemp("tiny")
     corpus = []
-    for name in ["synthetic", "synthetic_math"]:
+    for name in ["synthetic", "synthetic2"]:
         t = load_task(name, n_test=None)
         for ex in t.train[:300]:
-            corpus.append(" ".join(str(v) for v in ex.values()))
-    corpus += ["Input: Output: Sequence: Class: A B left right red blue foo bar Question: Answer: The answer is N/A"]
+            corpus.append(ex["text"])
+    corpus += ["Input: Output: Sequence: Class: A B left right red blue foo bar Query Candidate Label Yes No N/A"]
     tok = Tokenizer(models.BPE())
     tok.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
     tok.decoder = decoders.ByteLevel()
@@ -70,27 +69,6 @@ def test_prompt_format():
     prompt = P.build_cls_prompt(tpl, demos, [0, 1], tpl.verbalizers, task.test[0])
     assert prompt.count("Output:") == 3 and prompt.endswith("Output:")
     assert "Output: A\n\n" in prompt and "Output: B\n\n" in prompt
-
-
-def test_gen_demo_modes():
-    task = load_task("synthetic_math", n_test=5)
-    demos = task.train[:3]
-    gold = P.gen_demo_strings(task, demos, "cot", 0)
-    assert f"The answer is {demos[0]['answer']}." in gold[0]
-    direct = P.gen_demo_strings(task, demos, "direct", 0)
-    assert demos[0]["rationale"] not in direct[0]
-    wrong = P.gen_demo_strings(task, demos, "wrong_answer", 0)
-    assert all(f"The answer is {d['answer']}." not in w for d, w in zip(demos, wrong))
-    shuf = P.gen_demo_strings(task, demos, "shuffled_rationale", 0)
-    assert demos[1]["rationale"] in shuf[0]
-
-
-def test_metrics():
-    assert extract_number("so 3+4=7. The answer is 1,234.") == "1234"
-    assert extract_number("we get 5 then 12") == "12"
-    assert numbers_equal("18", "18.0") and not numbers_equal(None, "1")
-    assert match_label(" Positive.", ["negative", "positive"]) == 1
-    assert match_label("hmm", ["negative", "positive"]) == -1
 
 
 # ---------------------------------------------------------------- end to end
@@ -132,17 +110,6 @@ def test_resume(tiny_model_dir, tmp_path):
     assert len(df) == 2
 
 
-@pytest.mark.parametrize("exp", ["shots", "cot", "order"])
-def test_gen_experiments(tiny_model_dir, tmp_path, exp):
-    from scripts.run_experiment import main
-
-    main(["--model", tiny_model_dir, "--task", "synthetic_math", "--exp", exp, "--shots", "0", "1",
-          "--k", "2", "--seeds", "1", "--perms", "2", "--n-test", "4", "--max-new-tokens", "8",
-          "--out", str(tmp_path), "--device", "cpu"])
-    df = pd.read_csv(next(tmp_path.glob(f"{exp}/synthetic_math/*/summary.csv")))
-    assert (df.status == "ok").all()
-
-
 def test_too_long_is_skipped(tiny_model_dir, tmp_path):
     from scripts.run_experiment import main
 
@@ -161,10 +128,8 @@ def test_plotting(tiny_model_dir, tmp_path):
     for exp in ["shots", "labels", "order", "template"]:
         main(["--model", tiny_model_dir, "--task", "synthetic", "--exp", exp, "--shots", "0", "2", "4",
               "--k", "4", "--seeds", "2", "--perms", "3", "--n-test", "16", "--out", str(res), "--device", "cpu"])
-    main(["--model", tiny_model_dir, "--task", "synthetic_math", "--exp", "cot", "--k", "2", "--seeds", "1",
-          "--n-test", "4", "--max-new-tokens", "8", "--out", str(res), "--device", "cpu"])
     root = Path(__file__).resolve().parents[1]
     subprocess.run([sys.executable, str(root / "scripts/plot_results.py"), "--results", str(res),
                     "--out", str(tmp_path / "fig")], check=True)
     pngs = {p.name for p in (tmp_path / "fig").glob("*.png")}
-    assert {"shots_acc.png", "labels_acc.png", "order_acc.png", "template_acc.png", "cot_acc.png"} <= pngs
+    assert {"shots_acc.png", "labels_acc.png", "order_acc.png", "template_acc.png"} <= pngs

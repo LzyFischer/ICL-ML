@@ -31,7 +31,7 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from . import prompts as P
-from .metrics import batch_calibrate, macro_f1, match_label
+from .metrics import batch_calibrate, macro_f1
 from .retrieval import Retriever
 from .tasks import ClassificationTask
 
@@ -207,21 +207,16 @@ def evaluate_demos(model, task: ClassificationTask, queries: list[dict], demo_id
         prompts.append(p)
     gold = [q["label"] for q in queries]
     C = len(verb)
-    if model.supports_scoring:
-        scores = model.score_choices(prompts, P.cls_choices(verb))
-        pred = scores.argmax(1).tolist()
-        pred_bc = batch_calibrate(scores).argmax(1).tolist()
-    else:
-        gens = model.generate(prompts, max_new_tokens=8, stop=["\n"])
-        pred, pred_bc, scores = [match_label(g, verb) for g in gens], None, None
+    scores = model.score_choices(prompts, P.cls_choices(verb))
+    pred = scores.argmax(1).tolist()
+    pred_bc = batch_calibrate(scores).argmax(1).tolist()
     acc = float(np.mean([p == y for p, y in zip(pred, gold)]))
     return {
         "pred": pred, "gold": gold, "scores": scores, "prompts": prompts,
         "acc": acc,
-        "acc_bc": float(np.mean([p == y for p, y in zip(pred_bc, gold)])) if pred_bc else float("nan"),
+        "acc_bc": float(np.mean([p == y for p, y in zip(pred_bc, gold)])),
         "macro_f1": macro_f1(gold, pred, C),
         "majority_pred_frac": max(pred.count(i) for i in range(C)) / len(pred),
-        "invalid_frac": pred.count(-1) / len(pred),
         "dropped_demos": n_dropped,
         "mean_prompt_tokens": float(np.mean([model.n_tokens(p) for p in prompts[:100]])),
     }

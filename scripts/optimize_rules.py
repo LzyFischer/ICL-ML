@@ -17,7 +17,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from icl.models import load_model  # noqa: E402
+from icl.models import APIModel, HFModel  # noqa: E402
 from icl.retrieval import Retriever, load_embedder  # noqa: E402
 from icl.rule_opt import RuleOptimizer  # noqa: E402
 from icl.selection import HUMAN_RULES  # noqa: E402
@@ -32,7 +32,7 @@ def parse_args(argv=None):
     p.add_argument("--optimizer-backend", choices=["hf", "api"], default="hf")
     p.add_argument("--base-url", default=None)
     p.add_argument("--optimizer-thinking", action="store_true", help="let a hybrid-thinking optimizer think")
-    p.add_argument("--tasks", nargs="+", default=["sst2", "ag_news", "trec"])
+    p.add_argument("--tasks", nargs="+", default=["sst2", "ag_news", "trec"], help="meta-train tasks")
     p.add_argument("--dev-size", type=int, default=200)
     p.add_argument("--pool-size", type=int, default=5000)
     p.add_argument("--k", type=int, default=8)
@@ -52,14 +52,14 @@ def parse_args(argv=None):
 def main(argv=None):
     a = parse_args(argv)
     kw = dict(batch_size=a.batch_size, device=a.device, dtype=a.dtype)
-    target = load_model("hf", a.target, **kw)
+    target = HFModel(a.target, **kw)
     sel_name = a.selector or a.target
-    scorer = target if sel_name == a.target else load_model("hf", sel_name, **kw)
+    scorer = target if sel_name == a.target else HFModel(sel_name, **kw)
     opt_name = a.optimizer or sel_name
     if a.optimizer_backend == "api":
-        optimizer = load_model("api", opt_name, base_url=a.base_url)
+        optimizer = APIModel(opt_name, base_url=a.base_url)
     else:
-        optimizer = {a.target: target, sel_name: scorer}.get(opt_name) or load_model("hf", opt_name, **kw)
+        optimizer = {a.target: target, sel_name: scorer}.get(opt_name) or HFModel(opt_name, **kw)
 
     embedder = load_embedder(a.embedder, a.device)
     tasks, retrievers = [], {}

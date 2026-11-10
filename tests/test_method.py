@@ -178,7 +178,7 @@ def test_generic_loader_maps_label_names(monkeypatch):
         return fake
 
     monkeypatch.setattr(T, "_hf", fake_hf)
-    tr, te, _ = T._load_text_cls([("broken/mirror", None, "text", "label"), ("ok", None, "text", "label")],
+    tr, te = T._load_text_cls([("broken/mirror", None, "text", "label"), ("ok", None, "text", "label")],
                                  {"objective": 0, "subjective": 1})
     assert calls == ["broken/mirror", "ok"]
     assert [r["label"] for r in tr] == [1, 0] and te[0]["label"] == 0

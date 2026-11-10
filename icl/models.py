@@ -1,37 +1,21 @@
-"""Model backends.
+"""Model wrappers.
 
-HFModel  - local HuggingFace causal LM. Supports exact label scoring
-           (log-probabilities of each label word), which is the standard way to
-           evaluate ICL on classification and needs no answer parsing.
-APIModel - any OpenAI-compatible endpoint (OpenAI, a local ``vllm serve``,
-           Together, DeepSeek, ...). Generation only; classification falls back
-           to "generate a few tokens and match the label word".
+HFModel  - local HuggingFace causal LM: exact label scoring (log-probabilities
+           of each label word) for evaluation and for the LLM selector, plus
+           chat generation for the rule optimizer.
+APIModel - optional: an OpenAI-compatible chat endpoint, only used as the
+           rule optimizer (``optimize_rules.py --optimizer-backend api``).
 """
 
 from __future__ import annotations
 
 import os
-from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 
 
-def truncate_at_stop(text: str, stop: list[str] | None) -> str:
-    if not stop:
-        return text
-    cut = len(text)
-    for s in stop:
-        i = text.find(s)
-        if i != -1:
-            cut = min(cut, i)
-    return text[:cut]
-
-
 class HFModel:
-    supports_scoring = True
-
-    def __init__(self, name: str, batch_size: int = 8, device: str | None = None, dtype: str = "auto",
-                 trust_remote_code: bool = False):
+    def __init__(self, name: str, batch_size: int = 8, device: str | None = None, dtype: str = "auto"):
         import torch
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -46,18 +30,16 @@ class HFModel:
         else:
             torch_dtype = getattr(torch, dtype)
 
-        self.tok = AutoTokenizer.from_pretrained(name, trust_remote_code=trust_remote_code)
+        self.tok = AutoTokenizer.from_pretrained(name)
         if self.tok.pad_token is None:
             self.tok.pad_token = self.tok.eos_token
         try:
-            self.model = AutoModelForCausalLM.from_pretrained(name, dtype=torch_dtype,
-                                                              trust_remote_code=trust_remote_code)
+            self.model = AutoModelForCausalLM.from_pretrained(name, dtype=torch_dtype)
         except (ValueError, KeyError):
             # natively multimodal checkpoints (image-text-to-text) still work for text-only input
             from transformers import AutoModelForImageTextToText
 
-            self.model = AutoModelForImageTextToText.from_pretrained(name, dtype=torch_dtype,
-                                                                     trust_remote_code=trust_remote_code)
+            self.model = AutoModelForImageTextToText.from_pretrained(name, dtype=torch_dtype)
         self.model.to(device).eval()
         cfg = getattr(self.model.config, "text_config", None) or self.model.config
         self.max_len = getattr(cfg, "max_position_embeddings", None) or getattr(cfg, "n_positions", None) or 4096
@@ -158,82 +140,19 @@ class HFModel:
                         scores[i, j] = logp[r, pos, tgt].sum().item()
         return scores
 
-    # -- generation ------------------------------------------------------
-
-    def generate(self, prompts: list[str], max_new_tokens: int = 256, stop: list[str] | None = None) -> list[str]:
-        torch = self.torch
-        self.tok.padding_side = "left"
-        outs: list[str] = [""] * len(prompts)
-        order = np.argsort([-len(p) for p in prompts])
-        with torch.no_grad():
-            for b in range(0, len(order), self.batch_size):
-                idx = order[b : b + self.batch_size]
-                enc = self.tok([prompts[i] for i in idx], return_tensors="pt", padding=True).to(self.device)
-                kwargs = dict(max_new_tokens=max_new_tokens, do_sample=False, pad_token_id=self.tok.pad_token_id)
-                if stop:
-                    kwargs.update(stop_strings=stop, tokenizer=self.tok)
-                gen = self.model.generate(**enc, **kwargs)
-                new = gen[:, enc.input_ids.shape[1] :]
-                for i, text in zip(idx, self.tok.batch_decode(new, skip_special_tokens=True)):
-                    outs[i] = truncate_at_stop(text, stop)
-        self.tok.padding_side = "right"
-        return outs
-
 
 class APIModel:
-    """OpenAI-compatible endpoint. ``mode='completion'`` sends the raw few-shot
-    prompt (best for base models served by vLLM); ``mode='chat'`` wraps it in a
-    single user message (for chat-only APIs)."""
+    """OpenAI-compatible chat endpoint (OpenAI, DeepSeek, a local ``vllm serve``, ...)."""
 
-    supports_scoring = False
-
-    CHAT_SYSTEM = (
-        "You will see examples of a task followed by a new input. Continue the pattern: "
-        "reply with only the answer for the last input, in the same format as the examples."
-    )
-
-    def __init__(self, name: str, base_url: str | None = None, api_key: str | None = None,
-                 mode: str = "chat", max_workers: int = 8):
+    def __init__(self, name: str, base_url: str | None = None, api_key: str | None = None):
         from openai import OpenAI
 
         self.name = name
-        self.mode = mode
-        self.max_workers = max_workers
         self.client = OpenAI(base_url=base_url or os.environ.get("OPENAI_BASE_URL"),
                              api_key=api_key or os.environ.get("OPENAI_API_KEY", "EMPTY"))
-        self.max_len = 10**9  # unknown; let the server reject over-long prompts
-
-    def n_tokens(self, text: str) -> int:
-        return len(text) // 4  # rough estimate, only used for logging
-
-    def _one(self, prompt: str, max_new_tokens: int, stop: list[str] | None) -> str:
-        stop = (stop or [])[:4]  # OpenAI allows at most 4 stop sequences
-        if self.mode == "completion":
-            r = self.client.completions.create(model=self.name, prompt=prompt, max_tokens=max_new_tokens,
-                                               temperature=0, stop=stop or None)
-            text = r.choices[0].text
-        else:
-            r = self.client.chat.completions.create(
-                model=self.name, temperature=0, max_tokens=max_new_tokens, stop=stop or None,
-                messages=[{"role": "system", "content": self.CHAT_SYSTEM}, {"role": "user", "content": prompt}],
-            )
-            text = r.choices[0].message.content or ""
-        return truncate_at_stop(text, stop)
 
     def chat(self, user: str, system: str | None = None, max_new_tokens: int = 1024, thinking: bool = False) -> str:
         msgs = ([{"role": "system", "content": system}] if system else []) + [{"role": "user", "content": user}]
         r = self.client.chat.completions.create(model=self.name, messages=msgs, temperature=0,
                                                 max_tokens=max_new_tokens)
         return r.choices[0].message.content or ""
-
-    def generate(self, prompts: list[str], max_new_tokens: int = 256, stop: list[str] | None = None) -> list[str]:
-        with ThreadPoolExecutor(self.max_workers) as ex:
-            return list(ex.map(lambda p: self._one(p, max_new_tokens, stop), prompts))
-
-
-def load_model(backend: str, name: str, **kw):
-    if backend == "hf":
-        return HFModel(name, **{k: v for k, v in kw.items() if k in ("batch_size", "device", "dtype", "trust_remote_code")})
-    if backend == "api":
-        return APIModel(name, **{k: v for k, v in kw.items() if k in ("base_url", "api_key", "mode", "max_workers")})
-    raise ValueError(backend)

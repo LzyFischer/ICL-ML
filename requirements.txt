@@ -7,7 +7,7 @@ numpy
 pandas
 matplotlib
 tqdm
-# optional: API backend (OpenAI / vLLM server / Together / DeepSeek ...)
+# optional: only if the rule optimizer runs through an API (--optimizer-backend api)
 openai>=1.0
 # dev
 pytest

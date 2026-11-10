@@ -18,18 +18,17 @@ import numpy as np
 from tqdm import tqdm
 
 from . import prompts as P
-from .metrics import calibrate, extract_number, macro_f1, match_label, numbers_equal
-from .tasks import ClassificationTask, GenerationTask
+from .metrics import batch_calibrate, calibrate, macro_f1
+from .tasks import ClassificationTask
 
-CLS_EXPERIMENTS = ["shots", "labels", "order", "template"]
-GEN_EXPERIMENTS = ["shots", "cot", "order"]
+EXPERIMENTS = ["shots", "labels", "order", "template", "method"]
 
 
 SUMMARY_FIELDS = [
     "model", "task", "exp", "k", "mode", "template", "demo_seed", "perm_seed", "status", "n",
-    "acc", "acc_cal", "acc_bc", "macro_f1", "acc_flip", "majority_pred_frac", "invalid_frac",
+    "acc", "acc_cal", "acc_bc", "macro_f1", "acc_flip", "majority_pred_frac",
     "llm_frac", "selector_prompts", "selector_tokens", "dropped_demos",
-    "mean_output_chars", "mean_prompt_tokens", "seconds", "condition",
+    "mean_prompt_tokens", "seconds", "condition",
 ]
 
 
@@ -37,7 +36,7 @@ SUMMARY_FIELDS = [
 class Condition:
     exp: str
     k: int
-    mode: str = "gold"  # label mode (classification) or CoT mode (generation)
+    mode: str = "gold"  # label mode, or the selector name for --exp method
     template: int = 0
     demo_seed: int = 0
     perm_seed: int | None = None
@@ -47,26 +46,18 @@ class Condition:
 
 
 def build_conditions(exp: str, task, shots: list[int], k: int, seeds: int, perms: int) -> list[Condition]:
-    is_gen = isinstance(task, GenerationTask)
-    base_mode = "cot" if is_gen else "gold"
-    valid = GEN_EXPERIMENTS if is_gen else CLS_EXPERIMENTS
-    if exp not in valid:
-        raise ValueError(f"Experiment {exp!r} not available for {task.name}; choose from {valid}")
     S = range(seeds)
 
     if exp == "shots":
         out = []
         for kk in shots:  # k=0 is deterministic: one seed is enough
-            out += [Condition(exp, kk, base_mode, 0, s) for s in (range(1) if kk == 0 else S)]
+            out += [Condition(exp, kk, "gold", 0, s) for s in (range(1) if kk == 0 else S)]
         return out
     if exp == "labels":
         out = [Condition(exp, 0, "gold", 0, 0)]  # zero-shot reference
         return out + [Condition(exp, k, m, 0, s) for m in P.LABEL_MODES for s in S]
-    if exp == "cot":
-        out = [Condition(exp, 0, "cot", 0, 0)]
-        return out + [Condition(exp, k, m, 0, s) for m in P.COT_MODES for s in S]
     if exp == "order":
-        return [Condition(exp, k, base_mode, 0, s, p) for s in S for p in range(perms)]
+        return [Condition(exp, k, "gold", 0, s, p) for s in S for p in range(perms)]
     if exp == "template":
         return [Condition(exp, k, "gold", t, s) for t in range(len(task.templates)) for s in S]
     raise ValueError(exp)
@@ -77,14 +68,13 @@ def _slug(name: str) -> str:
 
 
 class Runner:
-    def __init__(self, model, model_name: str, task, out_root: str | Path, balanced: bool = True,
-                 max_new_tokens: int = 256, save_predictions: bool = True):
+    def __init__(self, model, model_name: str, task: ClassificationTask, out_root: str | Path,
+                 balanced: bool = True, save_predictions: bool = True):
         self.model = model
         self.model_name = model_name
         self.task = task
         self.out_root = Path(out_root)
         self.balanced = balanced
-        self.max_new_tokens = max_new_tokens
         self.save_predictions = save_predictions
 
     def out_dir(self, exp: str) -> Path:
@@ -111,10 +101,7 @@ class Runner:
         rows = []
         for cond in tqdm(todo, desc=f"{self.task.name}/{cond_exp(conditions)}/{_slug(self.model_name)}"):
             t0 = time.time()
-            if isinstance(self.task, ClassificationTask):
-                row, preds = self._eval_cls(cond)
-            else:
-                row, preds = self._eval_gen(cond)
+            row, preds = self._eval_cls(cond)
             row = {"model": self.model_name, "task": self.task.name, **asdict(cond), **row,
                    "seconds": round(time.time() - t0, 1), "condition": cond.key()}
             self._append_csv(summary_path, row)
@@ -156,57 +143,28 @@ class Runner:
         if too_long:
             return {"status": "too_long", "mean_prompt_tokens": round(mean_len)}, []
 
-        if self.model.supports_scoring:
-            scores = self.model.score_choices(prompts, choices)
-            pred = scores.argmax(1).tolist()
-            cf_prompt = P.build_cls_prompt(tpl, demos, shown, verb, task.content_free())
-            cf = self.model.score_choices([cf_prompt], choices)
-            pred_cal = calibrate(scores, cf).argmax(1).tolist()
-        else:
-            gens = self.model.generate(prompts, max_new_tokens=5, stop=["\n"])
-            pred = [match_label(g, verb) for g in gens]
-            pred_cal, scores = None, None
+        scores = self.model.score_choices(prompts, choices)
+        pred = scores.argmax(1).tolist()
+        cf_prompt = P.build_cls_prompt(tpl, demos, shown, verb, task.content_free())
+        cf = self.model.score_choices([cf_prompt], choices)
+        pred_cal = calibrate(scores, cf).argmax(1).tolist()
+        pred_bc = batch_calibrate(scores).argmax(1).tolist()
 
         row = {
             "status": "ok",
             "n": len(gold),
             "acc": _mean([p == y for p, y in zip(pred, gold)]),
             "macro_f1": macro_f1(gold, pred, C),
-            "acc_cal": _mean([p == y for p, y in zip(pred_cal, gold)]) if pred_cal else float("nan"),
+            "acc_cal": _mean([p == y for p, y in zip(pred_cal, gold)]),
+            "acc_bc": _mean([p == y for p, y in zip(pred_bc, gold)]),
             # how often the model follows the (corrupted) mapping shown in the demos
             "acc_flip": _mean([p == P.flip(y, C) for p, y in zip(pred, gold)]) if c.mode == "flipped" else float("nan"),
             "majority_pred_frac": max(pred.count(i) for i in range(C)) / len(pred),
-            "invalid_frac": pred.count(-1) / len(pred),
             "mean_prompt_tokens": round(mean_len),
         }
-        preds = [{"idx": i, "gold": y, "pred": p, **({"pred_cal": pred_cal[i]} if pred_cal else {}),
-                  **({"scores": [round(float(s), 4) for s in scores[i]]} if scores is not None else {})}
+        preds = [{"idx": i, "gold": y, "pred": p, "pred_cal": pred_cal[i],
+                  "scores": [round(float(s), 4) for s in scores[i]]}
                  for i, (y, p) in enumerate(zip(gold, pred))]
-        return row, preds
-
-    # -- generation ------------------------------------------------------------
-
-    def _eval_gen(self, c: Condition):
-        task: GenerationTask = self.task
-        demos = P.permute(P.sample_demos(task.train, c.k, c.demo_seed, balanced=False), c.perm_seed)
-        demo_str = P.gen_demo_strings(task, demos, c.mode, c.demo_seed)
-        prompts = [P.build_gen_prompt(task, demo_str, x["question"]) for x in task.test]
-        too_long, mean_len = self._too_long(prompts, reserve=self.max_new_tokens)
-        if too_long:
-            return {"status": "too_long", "mean_prompt_tokens": round(mean_len)}, []
-        gens = self.model.generate(prompts, max_new_tokens=self.max_new_tokens, stop=task.stop)
-        extracted = [extract_number(g) for g in gens]
-        correct = [numbers_equal(e, x["answer"]) for e, x in zip(extracted, task.test)]
-        row = {
-            "status": "ok",
-            "n": len(gens),
-            "acc": _mean(correct),
-            "invalid_frac": _mean([e is None for e in extracted]),
-            "mean_output_chars": round(float(np.mean([len(g) for g in gens])), 1),
-            "mean_prompt_tokens": round(mean_len),
-        }
-        preds = [{"idx": i, "gold": x["answer"], "pred": e, "correct": ok, "output": g}
-                 for i, (x, g, e, ok) in enumerate(zip(task.test, gens, extracted, correct))]
         return row, preds
 
 
@@ -260,7 +218,7 @@ def run_method(model, model_name: str, task, selectors: dict, k: int, orders: li
             t1 = time.time()
             ev = evaluate_demos(model, task, task.test, sel.demos, order_seed=c.perm_seed)
             row = {"model": model_name, "task": task.name, **asdict(c), "status": "ok", "n": len(task.test),
-                   **{f: ev[f] for f in ["acc", "acc_bc", "macro_f1", "majority_pred_frac", "invalid_frac",
+                   **{f: ev[f] for f in ["acc", "acc_bc", "macro_f1", "majority_pred_frac",
                                          "dropped_demos"]},
                    "mean_prompt_tokens": round(ev["mean_prompt_tokens"]),
                    "llm_frac": float(np.mean(sel.llm_used)) if sel.llm_used else 0.0,

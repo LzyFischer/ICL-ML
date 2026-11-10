@@ -81,6 +81,7 @@ class RuleOptimizer:
         self.max_rules, self.n_cases = max_rules, n_cases
         self.out_dir = Path(out_dir)
         self.out_dir.mkdir(parents=True, exist_ok=True)
+        (self.out_dir / "log.jsonl").unlink(missing_ok=True)  # one log per run
         self.opt_tokens, self.opt_thinking = optimizer_max_new_tokens, optimizer_thinking
         self.history: list[dict] = []
         self.knn = {}

@@ -1,52 +1,8 @@
-"""Answer extraction and scoring helpers."""
+"""Calibration and macro-F1."""
 
 from __future__ import annotations
 
-import re
-
 import numpy as np
-
-_NUM = r"-?\d[\d,]*(?:\.\d+)?"
-_ANSWER_IS = re.compile(r"answer is[:\s]*\$?\s*(" + _NUM + ")", re.IGNORECASE)
-_ANY_NUM = re.compile(_NUM)
-
-
-def extract_number(text: str) -> str | None:
-    """'The answer is 42.' -> '42'; otherwise the last number in the text."""
-    m = _ANSWER_IS.search(text)
-    if m:
-        return _norm(m.group(1))
-    nums = _ANY_NUM.findall(text)
-    return _norm(nums[-1]) if nums else None
-
-
-def _norm(s: str) -> str:
-    s = s.replace(",", "").rstrip(".")
-    try:
-        v = float(s)
-        return str(int(v)) if v == int(v) else str(v)
-    except ValueError:
-        return s
-
-
-def numbers_equal(pred: str | None, gold: str) -> bool:
-    if pred is None:
-        return False
-    try:
-        return abs(float(pred) - float(_norm(gold))) < 1e-6
-    except ValueError:
-        return pred == _norm(gold)
-
-
-def match_label(text: str, verbalizers: list[str]) -> int:
-    """Map a generated string to a label index (-1 if none matches).
-    Used only by backends without log-prob scoring."""
-    t = text.strip().strip(".\"'*").lower()
-    for i, v in enumerate(verbalizers):  # exact / prefix match first
-        if t == v.lower() or t.startswith(v.lower()):
-            return i
-    hits = [i for i, v in enumerate(verbalizers) if re.search(r"\b" + re.escape(v.lower()) + r"\b", t)]
-    return hits[0] if len(hits) == 1 else -1
 
 
 def calibrate(scores: np.ndarray, cf_scores: np.ndarray) -> np.ndarray:

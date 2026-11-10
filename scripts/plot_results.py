@@ -30,7 +30,6 @@ plt.rcParams.update({
 
 MODE_ORDER = {
     "labels": ["zero-shot", "gold", "random", "flipped", "abstract", "follows flipped"],
-    "cot": ["zero-shot", "cot", "direct", "wrong_answer", "shuffled_rationale"],
 }
 
 
@@ -247,9 +246,6 @@ def table(df: pd.DataFrame, out: Path):
         if exp == "labels":
             d = labels_frame(d)
             key = "cond"
-        elif exp == "cot":
-            d = d.assign(cond=np.where(d.k == 0, "zero-shot", d["mode"]))
-            key = "cond"
         elif exp == "template":
             key = "template"
         elif exp == "order":
@@ -295,9 +291,6 @@ def main():
             plot_shots(d, out, metric)
         elif exp == "labels":
             _grouped_bars(labels_frame(d), out, exp, "acc", "cond", MODE_ORDER["labels"], "demonstration labels")
-        elif exp == "cot":
-            d = d.assign(cond=np.where(d.k == 0, "zero-shot", d["mode"]))
-            _grouped_bars(d, out, exp, "acc", "cond", MODE_ORDER["cot"], "demonstration format")
         elif exp == "order":
             plot_order(d, out, metric)
         elif exp == "template":

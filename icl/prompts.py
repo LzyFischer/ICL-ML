@@ -5,7 +5,7 @@ from __future__ import annotations
 import random
 from collections import defaultdict
 
-from .tasks import ABSTRACT_LABELS, ClassificationTask, GenerationTask, Template
+from .tasks import ABSTRACT_LABELS, Template
 
 # ----------------------------------------------------------------------------
 # Demonstration sampling
@@ -97,55 +97,8 @@ def build_cls_prompt(
     parts = [template.render_input(d) + template.render_label(verbalizers[y]) for d, y in zip(demos, labels)]
     parts.append(template.render_input(query))
     body = template.sep.join(parts)
-    return (template.instruction + template.sep + body) if template.instruction else body
+    return body
 
 
 def cls_choices(verbalizers: list[str]) -> list[str]:
     return [Template.render_label(v) for v in verbalizers]
-
-
-# ----------------------------------------------------------------------------
-# Generation (GSM8K) demos
-# ----------------------------------------------------------------------------
-
-COT_MODES = ["cot", "direct", "wrong_answer", "shuffled_rationale"]
-
-
-def gen_demo_strings(task: GenerationTask, demos: list[dict], mode: str, seed: int) -> list[str]:
-    """Render math demonstrations under different conditions.
-
-    cot                - gold step-by-step rationale + gold answer
-    direct             - answer only (no reasoning)
-    wrong_answer       - gold rationale, but the final answer is corrupted
-    shuffled_rationale - rationales are shuffled across demos (reasoning no
-                         longer matches the question), answers stay gold
-    """
-    rng = random.Random(30_000 + seed)
-    rationales = [d["rationale"] for d in demos]
-    if mode == "shuffled_rationale" and len(demos) > 1:
-        # derangement-ish: rotate by one so no demo keeps its own rationale
-        rationales = rationales[1:] + rationales[:1]
-    out = []
-    for d, r in zip(demos, rationales):
-        ans = d["answer"]
-        if mode == "wrong_answer":
-            ans = _corrupt_number(ans, rng)
-        rationale = None if mode == "direct" else r
-        if mode not in COT_MODES:
-            raise ValueError(f"Unknown CoT mode {mode!r}; choose from {COT_MODES}")
-        out.append(task.format_question(d["question"]) + task.format_answer(rationale, ans))
-    return out
-
-
-def _corrupt_number(ans: str, rng: random.Random) -> str:
-    try:
-        v = float(ans)
-    except ValueError:
-        return ans + "1"
-    delta = rng.choice([-1, 1]) * rng.randint(1, max(2, int(abs(v) * 0.5) + 1))
-    w = v + delta
-    return str(int(w)) if w == int(w) else f"{w:.2f}"
-
-
-def build_gen_prompt(task: GenerationTask, demo_strings: list[str], question: str) -> str:
-    return task.sep.join(demo_strings + [task.format_question(question)])

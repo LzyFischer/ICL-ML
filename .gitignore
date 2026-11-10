@@ -5,3 +5,5 @@ results/
 figures/
 *.egg-info/
 .venv/
+runs/
+rule_opt/
