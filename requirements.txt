@@ -1,7 +1,8 @@
 torch>=2.1
-transformers>=4.56
+transformers>=4.56   # Qwen3.5 needs a recent release; upgrade if loading fails
 datasets>=2.18
 accelerate>=0.27
+sentence-transformers>=3.0   # retrieval for --exp method
 numpy
 pandas
 matplotlib

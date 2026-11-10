@@ -58,6 +58,14 @@ def calibrate(scores: np.ndarray, cf_scores: np.ndarray) -> np.ndarray:
     return norm_logp(scores) - norm_logp(cf_scores)
 
 
+def batch_calibrate(scores: np.ndarray) -> np.ndarray:
+    """Batch calibration (Zhou et al. 2024): subtract the mean label
+    probability over the evaluated batch, estimated without labels."""
+    s = scores - scores.max(axis=1, keepdims=True)
+    logp = s - np.log(np.exp(s).sum(axis=1, keepdims=True))
+    return logp - np.log(np.exp(logp).mean(axis=0, keepdims=True))
+
+
 def macro_f1(y_true: list[int], y_pred: list[int], num_labels: int) -> float:
     f1s = []
     for c in range(num_labels):

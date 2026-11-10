@@ -52,6 +52,7 @@ class ClassificationTask:
     test: list[dict]
     text_fields: list[str]
     type: str = "classification"
+    dev: list[dict] = field(default_factory=list)
 
     @property
     def num_labels(self) -> int:
@@ -70,6 +71,7 @@ class GenerationTask:
     train: list[dict]  # keys: question, rationale, answer
     test: list[dict]
     type: str = "generation"
+    dev: list[dict] = field(default_factory=list)
     sep: str = "\n\n"
     stop: list[str] = field(default_factory=lambda: ["\n\nQuestion:", "\nQuestion:"])
 
@@ -123,16 +125,109 @@ def load_rte() -> tuple[list[dict], list[dict]]:
     return conv(ds["train"]), conv(ds["validation"])
 
 
-def make_synthetic(n_train: int = 2000, n_test: int = 500, seed: int = 0):
+# ---- generic loader for single-text classification datasets ---------------
+
+
+def _label_names(ds_split, label_col: str):
+    feat = ds_split.features.get(label_col)
+    if feat is not None and hasattr(feat, "names"):
+        return list(feat.names)
+    return None
+
+
+def _load_text_cls(candidates, aliases: dict[str, int] | None):
+    """Try several HF dataset ids in order (mirrors move around).
+
+    Each candidate is (path, config, text_col, label_col). Labels are mapped to
+    our canonical order through their *names* (``aliases``: lowercased name ->
+    index) so that a mirror with a different label order cannot silently
+    scramble the verbalizers. With ``aliases=None`` the dataset's own label
+    order/names are used and returned.
+    """
+    errors = []
+    for path, cfg, text_col, label_col in candidates:
+        try:
+            ds = _hf(path, cfg)
+        except Exception as e:  # noqa: BLE001 - try the next mirror
+            errors.append(f"{path}: {type(e).__name__}: {e}")
+            continue
+        test_split = "test" if "test" in ds else "validation"
+        names = _label_names(ds["train"], label_col)
+        if names is None and "label_text" in ds["train"].column_names:
+            pairs = sorted({(r[label_col], r["label_text"]) for r in ds["train"]})
+            names = [n for _, n in pairs]
+        if aliases is not None:
+            if names is None:
+                remap = lambda y: y  # assume canonical order
+            else:
+                table = {i: aliases[_norm_name(n)] for i, n in enumerate(names)}
+                remap = table.__getitem__
+            out_names = None
+        else:
+            remap, out_names = (lambda y: y), names
+
+        def conv(split):
+            return [{"text": " ".join(str(r[text_col]).split()), "label": remap(r[label_col])} for r in ds[split]]
+
+        return conv("train"), conv(test_split), out_names
+    raise RuntimeError("Could not load any mirror:\n  " + "\n  ".join(errors))
+
+
+def _norm_name(n: str) -> str:
+    return str(n).strip().lower().replace("_", " ")
+
+
+def load_trec():
+    aliases = {"abbr": 0, "abbreviation": 0, "enty": 1, "entity": 1, "desc": 2, "description": 2,
+               "hum": 3, "human": 3, "loc": 4, "location": 4, "num": 5, "numeric": 5}
+    tr, te, _ = _load_text_cls([("CogComp/trec", None, "text", "coarse_label"),
+                                ("SetFit/TREC-QC", None, "text", "label_coarse")], aliases)
+    return tr, te
+
+
+def load_cr():
+    tr, te, _ = _load_text_cls([("SetFit/CR", None, "text", "label")], {"negative": 0, "positive": 1})
+    return tr, te
+
+
+def load_subj():
+    tr, te, _ = _load_text_cls([("SetFit/subj", None, "text", "label")], {"objective": 0, "subjective": 1})
+    return tr, te
+
+
+def load_emotion():
+    aliases = {"sadness": 0, "joy": 1, "love": 2, "anger": 3, "fear": 4, "surprise": 5}
+    tr, te, _ = _load_text_cls([("dair-ai/emotion", "split", "text", "label"),
+                                ("SetFit/emotion", None, "text", "label")], aliases)
+    return tr, te
+
+
+def load_banking77():
+    tr, te, names = _load_text_cls([("mteb/banking77", None, "text", "label"),
+                                    ("PolyAI/banking77", None, "text", "label")], None)
+    if names is None:
+        raise RuntimeError("banking77 mirror did not provide label names")
+    words = [_norm_name(n) for n in names]
+    TEMPLATES["banking77"] = [
+        Template("Query: {text}\nIntent:", words),
+        Template("{text}\nThe customer is asking about", words),
+        Template("Input: {text}\nOutput:", words),
+    ]
+    return tr, te
+
+
+def make_synthetic(n_train: int = 2000, n_test: int = 500, seed: int = 0, variant: int = 0):
     """A task that cannot be solved from pre-training priors.
 
     Inputs are sequences of nonsense words; the label is determined by which
     of two hidden word groups the *first* word comes from. The rule can only
     be inferred from demonstrations. Also used for offline tests.
     """
-    rng = random.Random(seed)
+    rng = random.Random(seed + 1000 * variant)
     group_a = ["blick", "dax", "wug", "fep", "toma", "lorp"]
     group_b = ["zib", "mek", "gorp", "vun", "snerf", "plim"]
+    if variant == 1:  # a second, unrelated synthetic task (used for meta-train/test splits in tests)
+        group_a, group_b = group_a[:3] + group_b[:3], group_a[3:] + group_b[3:]
     vocab = group_a + group_b
 
     def ex():
@@ -161,6 +256,31 @@ TEMPLATES: dict[str, list[Template]] = {
         Template("Premise: {sentence1}\nHypothesis: {sentence2}\nEntailment:", ["yes", "no"]),
         Template("Input: {sentence1} [SEP] {sentence2}\nOutput:", ["True", "False"]),
     ],
+    "trec": [
+        Template("Question: {text}\nAnswer type:", ["abbreviation", "entity", "description", "person", "location", "number"]),
+        Template("{text}\nThis question asks for a", ["abbreviation", "thing", "description", "person", "place", "number"]),
+        Template("Input: {text}\nOutput:", ["abbreviation", "entity", "description", "person", "location", "number"]),
+    ],
+    "cr": [
+        Template("Review: {text}\nSentiment:", ["negative", "positive"]),
+        Template("{text} It was", ["terrible", "great"]),
+        Template("Input: {text}\nOutput:", ["negative", "positive"]),
+    ],
+    "subj": [
+        Template("Input: {text}\nType:", ["objective", "subjective"]),
+        Template("{text} This is", ["factual", "opinion"]),
+        Template("Sentence: {text}\nOutput:", ["objective", "subjective"]),
+    ],
+    "emotion": [
+        Template("Text: {text}\nEmotion:", ["sadness", "joy", "love", "anger", "fear", "surprise"]),
+        Template("{text}\nThe writer feels", ["sad", "happy", "loving", "angry", "afraid", "surprised"]),
+        Template("Input: {text}\nOutput:", ["sadness", "joy", "love", "anger", "fear", "surprise"]),
+    ],
+    "synthetic2": [
+        Template("Input: {text}\nOutput:", ["A", "B"]),
+        Template("{text} =>", ["left", "right"]),
+        Template("Sequence: {text}\nClass:", ["red", "blue"]),
+    ],
     "synthetic": [
         Template("Input: {text}\nOutput:", ["A", "B"]),
         Template("{text} =>", ["left", "right"]),
@@ -173,6 +293,12 @@ TEXT_FIELDS = {
     "ag_news": ["text"],
     "rte": ["sentence1", "sentence2"],
     "synthetic": ["text"],
+    "synthetic2": ["text"],
+    "trec": ["text"],
+    "cr": ["text"],
+    "subj": ["text"],
+    "emotion": ["text"],
+    "banking77": ["text"],
 }
 
 CLS_LOADERS = {
@@ -180,6 +306,12 @@ CLS_LOADERS = {
     "ag_news": load_ag_news,
     "rte": load_rte,
     "synthetic": make_synthetic,
+    "synthetic2": lambda: make_synthetic(variant=1),
+    "trec": load_trec,
+    "cr": load_cr,
+    "subj": load_subj,
+    "emotion": load_emotion,
+    "banking77": load_banking77,
 }
 
 _CALC = re.compile(r"<<.*?>>")
@@ -214,19 +346,34 @@ GEN_LOADERS = {"gsm8k": load_gsm8k, "synthetic_math": make_synthetic_math}
 ALL_TASKS = sorted(list(CLS_LOADERS) + list(GEN_LOADERS))
 
 
-def load_task(name: str, n_test: int | None = 500, seed: int = 0):
-    """Load a task; the test set is subsampled once with a fixed seed so that
-    every condition / model is evaluated on exactly the same examples."""
+def load_task(name: str, n_test: int | None = 500, seed: int = 0, pool_size: int | None = None,
+              dev_size: int = 0):
+    """Load a task.
+
+    * the test set is subsampled once with a fixed seed, so every condition /
+      model is evaluated on exactly the same examples;
+    * ``dev_size`` > 0 carves a held-out dev set out of the *training* split
+      (used by rule optimisation; never touches the test split);
+    * ``pool_size`` caps the remaining training pool that demonstrations are
+      selected from (keeps retrieval and selection cheap).
+    """
     if name in CLS_LOADERS:
         train, test = CLS_LOADERS[name]()
-        return ClassificationTask(
-            name=name,
-            templates=TEMPLATES[name],
-            train=train,
-            test=_subsample(test, n_test, seed),
-            text_fields=TEXT_FIELDS[name],
-        )
-    if name in GEN_LOADERS:
+    elif name in GEN_LOADERS:
         train, test = GEN_LOADERS[name]()
-        return GenerationTask(name=name, train=train, test=_subsample(test, n_test, seed))
-    raise ValueError(f"Unknown task {name!r}. Available: {ALL_TASKS}")
+    else:
+        raise ValueError(f"Unknown task {name!r}. Available: {ALL_TASKS}")
+    rng = random.Random(seed + 1)
+    train = list(train)
+    rng.shuffle(train)
+    dev, train = train[:dev_size], train[dev_size:]
+    if pool_size is not None:
+        train = train[:pool_size]
+    test = _subsample(test, n_test, seed)
+    if name in CLS_LOADERS:
+        task = ClassificationTask(name=name, templates=TEMPLATES[name], train=train, test=test,
+                                  text_fields=TEXT_FIELDS[name])
+    else:
+        task = GenerationTask(name=name, train=train, test=test)
+    task.dev = dev
+    return task

@@ -49,17 +49,59 @@ class HFModel:
         self.tok = AutoTokenizer.from_pretrained(name, trust_remote_code=trust_remote_code)
         if self.tok.pad_token is None:
             self.tok.pad_token = self.tok.eos_token
-        self.model = AutoModelForCausalLM.from_pretrained(
-            name, dtype=torch_dtype, trust_remote_code=trust_remote_code
-        ).to(device)
-        self.model.eval()
-        cfg = self.model.config
+        try:
+            self.model = AutoModelForCausalLM.from_pretrained(name, dtype=torch_dtype,
+                                                              trust_remote_code=trust_remote_code)
+        except (ValueError, KeyError):
+            # natively multimodal checkpoints (image-text-to-text) still work for text-only input
+            from transformers import AutoModelForImageTextToText
+
+            self.model = AutoModelForImageTextToText.from_pretrained(name, dtype=torch_dtype,
+                                                                     trust_remote_code=trust_remote_code)
+        self.model.to(device).eval()
+        cfg = getattr(self.model.config, "text_config", None) or self.model.config
         self.max_len = getattr(cfg, "max_position_embeddings", None) or getattr(cfg, "n_positions", None) or 4096
+        self.max_len = min(self.max_len, 32768)
 
     # -- utilities -------------------------------------------------------
 
-    def encode(self, text: str) -> list[int]:
-        return self.tok(text).input_ids  # includes BOS if the model uses one
+    def encode(self, text: str, add_special_tokens: bool = True) -> list[int]:
+        return self.tok(text, add_special_tokens=add_special_tokens).input_ids  # BOS if the model uses one
+
+    @property
+    def has_chat_template(self) -> bool:
+        return bool(getattr(self.tok, "chat_template", None))
+
+    def chat_prompt(self, user: str, system: str | None = None, answer_choices=("Yes", "No")):
+        """Render a single-turn chat prompt (thinking disabled) ending right
+        where the assistant's answer starts. Returns (text, choices) where the
+        choices are spelled so that they continue the text correctly. Falls
+        back to plain text for models without a chat template."""
+        if self.has_chat_template:
+            msgs = ([{"role": "system", "content": system}] if system else []) + [{"role": "user", "content": user}]
+            text = self.tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True,
+                                                enable_thinking=False)
+            return text, list(answer_choices)
+        text = (system + "\n\n" if system else "") + user + "\nAnswer:"
+        return text, [" " + c for c in answer_choices]
+
+    def chat(self, user: str, system: str | None = None, max_new_tokens: int = 1024, thinking: bool = False) -> str:
+        """Free-form chat generation (used by the rule optimizer)."""
+        if self.has_chat_template:
+            msgs = ([{"role": "system", "content": system}] if system else []) + [{"role": "user", "content": user}]
+            text = self.tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True,
+                                                enable_thinking=thinking)
+        else:
+            text = (system + "\n\n" if system else "") + user + "\n"
+        enc = self.tok(text, return_tensors="pt", add_special_tokens=not self.has_chat_template).to(self.device)
+        budget = min(max_new_tokens, self.max_len - enc.input_ids.shape[1])
+        if budget < 16:
+            print(f"[warn] chat prompt ({enc.input_ids.shape[1]} tokens) does not fit the context window")
+            return ""
+        with self.torch.no_grad():
+            gen = self.model.generate(**enc, max_new_tokens=budget, do_sample=False,
+                                      pad_token_id=self.tok.pad_token_id)
+        return self.tok.decode(gen[0, enc.input_ids.shape[1]:], skip_special_tokens=True)
 
     def n_tokens(self, text: str) -> int:
         return len(self.encode(text))
@@ -79,7 +121,7 @@ class HFModel:
 
     # -- scoring ---------------------------------------------------------
 
-    def score_choices(self, prompts: list[str], choices: list[str]) -> np.ndarray:
+    def score_choices(self, prompts: list[str], choices: list[str], add_special_tokens: bool = True) -> np.ndarray:
         """Return an [N, C] array: total log P(choice | prompt).
 
         Uses one forward pass per prompt when every choice is a single,
@@ -88,7 +130,7 @@ class HFModel:
         """
         torch = self.torch
         choice_ids = [self.tok(c, add_special_tokens=False).input_ids for c in choices]
-        prompt_ids = [self.encode(p) for p in prompts]
+        prompt_ids = [self.encode(p, add_special_tokens) for p in prompts]
         single = all(len(c) == 1 for c in choice_ids) and len({c[0] for c in choice_ids}) == len(choice_ids)
         scores = np.zeros((len(prompts), len(choices)), dtype=np.float64)
 
@@ -177,6 +219,12 @@ class APIModel:
             )
             text = r.choices[0].message.content or ""
         return truncate_at_stop(text, stop)
+
+    def chat(self, user: str, system: str | None = None, max_new_tokens: int = 1024, thinking: bool = False) -> str:
+        msgs = ([{"role": "system", "content": system}] if system else []) + [{"role": "user", "content": user}]
+        r = self.client.chat.completions.create(model=self.name, messages=msgs, temperature=0,
+                                                max_tokens=max_new_tokens)
+        return r.choices[0].message.content or ""
 
     def generate(self, prompts: list[str], max_new_tokens: int = 256, stop: list[str] | None = None) -> list[str]:
         with ThreadPoolExecutor(self.max_workers) as ex:

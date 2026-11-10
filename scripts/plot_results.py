@@ -55,9 +55,9 @@ def _axes(n):
 
 def _finish(fig, axes, path: Path, handles_from=0):
     h, l = axes[handles_from].get_legend_handles_labels()
-    if h:
-        fig.legend(h, l, loc="upper center", ncol=min(len(l), 4), bbox_to_anchor=(0.5, 1.08))
     fig.tight_layout()
+    if h:  # anchored above the axes, so it never covers titles however many rows it wraps to
+        fig.legend(h, l, loc="lower center", ncol=min(len(l), 4), bbox_to_anchor=(0.5, 1.0))
     fig.savefig(path, dpi=200, bbox_inches="tight")
     plt.close(fig)
     print("wrote", path)
@@ -140,9 +140,110 @@ def plot_order(df, out, metric):
     _finish(fig, axes, out / f"order_{metric}.png")
 
 
+METHOD_ORDER = ["random", "knn", "topm_random", "llm_norules", "llm_human", "llm_human_adaptive",
+                "llm_learned", "llm_learned_adaptive"]
+
+
+def _methods(d):
+    present = set(d["mode"])
+    return [m for m in METHOD_ORDER if m in present] + sorted(present - set(METHOD_ORDER))
+
+
+def method_colors(d) -> dict:
+    return {m: PALETTE[i % len(PALETTE)] for i, m in enumerate(_methods(d))}
+
+
+def plot_method(df, out, metric):
+    """Main results: order seed 0; one panel per target model, bars = methods."""
+    d0 = df[df.perm_seed.fillna(0).astype(int) == 0]
+    models = sorted(d0.model_short.unique())
+    methods, cmap = _methods(d0), method_colors(d0)
+    fig, axes = _axes(len(models))
+    for ax, m in zip(axes, models):
+        dm = d0[d0.model_short == m]
+        piv = dm.pivot_table(index="task", columns="mode", values=metric, aggfunc="mean")
+        piv.loc["average"] = piv.mean()
+        cats = list(piv.index)
+        w = 0.8 / len(methods)
+        for i, meth in enumerate(methods):
+            xs = np.arange(len(cats)) + (i - (len(methods) - 1) / 2) * w
+            ax.bar(xs, piv.get(meth, pd.Series(index=cats, dtype=float)).reindex(cats), width=w * 0.92,
+                   color=cmap[meth], label=meth)
+        ax.set_xticks(np.arange(len(cats)), cats, rotation=20, ha="right")
+        ax.set_title(f"{m} (order seed 0)")
+        ax.set_ylabel(metric)
+        ax.grid(axis="x", visible=False)
+    _finish(fig, axes, out / f"method_{metric}.png")
+
+
+def plot_method_orders(df, out, metric):
+    """Robustness: every order seed as a dot, per task and method."""
+    tasks = sorted(df.task.unique())
+    methods, cmap = _methods(df), method_colors(df)
+    fig, axes = _axes(len(tasks))
+    rng = np.random.default_rng(0)
+    for ax, t in zip(axes, tasks):
+        d = df[df.task == t]
+        for i, meth in enumerate(methods):
+            v = d[d["mode"] == meth][metric].to_numpy()
+            if not len(v):
+                continue
+            ax.scatter(i + rng.uniform(-0.12, 0.12, len(v)), v, s=22, color=cmap[meth], alpha=0.8,
+                       edgecolor=SURFACE, linewidth=0.8, label=meth)
+            ax.hlines(v.mean(), i - 0.25, i + 0.25, color=INK, lw=1.5)
+        ax.set_xticks(range(len(methods)), methods, rotation=30, ha="right")
+        ax.set_title(f"{t}: each dot = one demo order")
+        ax.set_ylabel(metric)
+        ax.grid(axis="x", visible=False)
+    _finish(fig, axes, out / f"method_orders_{metric}.png")
+
+
+def plot_rule_log(log_path: Path, out: Path):
+    import json
+
+    rows = [json.loads(l) for l in log_path.read_text().splitlines() if l.strip()]
+    rows = [r for r in rows if r["score"] == r["score"]]  # drop NaN (unparseable rounds)
+    fig, ax = plt.subplots(figsize=(5, 3.4))
+    x = [r["round"] for r in rows]
+    y = [r["score"] for r in rows]
+    best = np.maximum.accumulate(y)
+    ax.plot(x, best, color=PALETTE[0], label="best so far")
+    ax.scatter(x, y, s=28, color=[PALETTE[0] if r["accepted"] else PALETTE[1] for r in rows],
+               edgecolor=SURFACE, linewidth=0.8, zorder=3)
+    ax.scatter([], [], s=28, color=PALETTE[1], label="rejected proposal")
+    ax.axhline(0, color=INK2, lw=1, ls="--")
+    ax.set_xlabel("optimisation round")
+    ax.set_ylabel("dev acc gain over kNN")
+    ax.legend(loc="lower right")
+    fig.tight_layout()
+    fig.savefig(out / "rule_opt_curve.png", dpi=200)
+    plt.close(fig)
+    print("wrote", out / "rule_opt_curve.png")
+
+
+def method_table(df: pd.DataFrame) -> str:
+    lines = []
+    d0 = df[df.perm_seed.fillna(0).astype(int) == 0]
+    for m, dm in d0.groupby("model_short"):
+        piv = dm.pivot_table(index="mode", columns="task", values="acc", aggfunc="mean")
+        piv["average"] = piv.mean(axis=1)
+        piv = piv.reindex([x for x in _methods(dm) if x in piv.index])
+        lines += [f"### main results: {m} (order seed 0)", _md(piv.reset_index()), ""]
+    g = df.groupby(["task", "model_short", "mode"])["acc"].agg(["mean", "std", "min", "max", "count"]).reset_index()
+    lines += ["### across order seeds", _md(g), ""]
+    return "\n".join(lines)
+
+
+def _md(frame):
+    return frame.to_markdown(index=False, floatfmt=".3f") if _has_tabulate() else frame.to_string(index=False)
+
+
 def table(df: pd.DataFrame, out: Path):
     lines = []
     for exp, d in df.groupby("exp"):
+        if exp == "method":
+            lines += ["## method\n", method_table(d)]
+            continue
         if exp == "labels":
             d = labels_frame(d)
             key = "cond"
@@ -175,14 +276,22 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--results", default="results")
     p.add_argument("--out", default="figures")
-    p.add_argument("--metric", default="acc", help="acc | acc_cal | macro_f1")
+    p.add_argument("--metric", default="acc", help="acc | acc_cal | acc_bc | macro_f1")
+    p.add_argument("--rule-log", default=None, help="log.jsonl from optimize_rules.py -> rule_opt_curve.png")
     a = p.parse_args()
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
+    if a.rule_log:
+        plot_rule_log(Path(a.rule_log), out)
+        if not list(Path(a.results).glob("*/*/*/summary.csv")):
+            return
     df = load(Path(a.results))
     for exp, d in df.groupby("exp"):
         metric = a.metric if a.metric in d and d[a.metric].notna().any() else "acc"
-        if exp == "shots":
+        if exp == "method":
+            plot_method(d, out, metric)
+            plot_method_orders(d, out, metric)
+        elif exp == "shots":
             plot_shots(d, out, metric)
         elif exp == "labels":
             _grouped_bars(labels_frame(d), out, exp, "acc", "cond", MODE_ORDER["labels"], "demonstration labels")

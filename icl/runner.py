@@ -27,7 +27,8 @@ GEN_EXPERIMENTS = ["shots", "cot", "order"]
 
 SUMMARY_FIELDS = [
     "model", "task", "exp", "k", "mode", "template", "demo_seed", "perm_seed", "status", "n",
-    "acc", "acc_cal", "macro_f1", "acc_flip", "majority_pred_frac", "invalid_frac",
+    "acc", "acc_cal", "acc_bc", "macro_f1", "acc_flip", "majority_pred_frac", "invalid_frac",
+    "llm_frac", "selector_prompts", "selector_tokens", "dropped_demos",
     "mean_output_chars", "mean_prompt_tokens", "seconds", "condition",
 ]
 
@@ -91,7 +92,8 @@ class Runner:
         d.mkdir(parents=True, exist_ok=True)
         return d
 
-    def _done_keys(self, path: Path) -> set[str]:
+    @staticmethod
+    def _done_keys(path: Path) -> set[str]:
         if not path.exists():
             return set()
         with path.open() as f:
@@ -226,3 +228,51 @@ def _fmt(row: dict) -> str:
             continue
         parts.append(f"{k}={v:.3f}" if isinstance(v, float) else f"{k}={v}")
     return "  " + " ".join(parts)
+
+
+# ----------------------------------------------------------------------------
+# Method comparison: per-query demonstration selection
+# ----------------------------------------------------------------------------
+
+
+def run_method(model, model_name: str, task, selectors: dict, k: int, orders: list[int], out_root,
+               seed: int = 0, save_predictions: bool = True) -> list[dict]:
+    """Evaluate each selector on the test set. Selection is done once per
+    selector; the chosen demos are then evaluated under every order seed
+    (order 0 = main results, all orders = robustness to ordering)."""
+    from .selection import evaluate_demos
+
+    out_dir = Path(out_root) / "method" / task.name / _slug(model_name)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    summary = out_dir / "summary.csv"
+    done = Runner._done_keys(summary)
+    rows = []
+    for name, selector in selectors.items():
+        conds = [Condition("method", k, name, 0, seed, o) for o in orders]
+        todo = [c for c in conds if c.key() not in done]
+        if not todo:
+            print(f"[resume] {task.name}/{name}: done")
+            continue
+        t0 = time.time()
+        sel = selector.select(task.test, k, seed=seed)
+        t_sel = time.time() - t0
+        for c in todo:
+            t1 = time.time()
+            ev = evaluate_demos(model, task, task.test, sel.demos, order_seed=c.perm_seed)
+            row = {"model": model_name, "task": task.name, **asdict(c), "status": "ok", "n": len(task.test),
+                   **{f: ev[f] for f in ["acc", "acc_bc", "macro_f1", "majority_pred_frac", "invalid_frac",
+                                         "dropped_demos"]},
+                   "mean_prompt_tokens": round(ev["mean_prompt_tokens"]),
+                   "llm_frac": float(np.mean(sel.llm_used)) if sel.llm_used else 0.0,
+                   "selector_prompts": sel.selector_prompts, "selector_tokens": sel.selector_tokens,
+                   "seconds": round(time.time() - t1 + (t_sel if c is todo[0] else 0), 1), "condition": c.key()}
+            Runner._append_csv(summary, row)
+            if save_predictions:
+                with (out_dir / "predictions.jsonl").open("a") as f:
+                    for i, (y, p) in enumerate(zip(ev["gold"], ev["pred"])):
+                        f.write(json.dumps({"condition": c.key(), "idx": i, "gold": y, "pred": p,
+                                            "demos": [int(j) for j in sel.demos[i]]}) + "\n")
+            rows.append(row)
+            print(f"  {task.name} {name:<22} order={c.perm_seed} acc={row['acc']:.3f} acc_bc={row['acc_bc']:.3f}"
+                  f" llm_frac={row['llm_frac']:.2f}")
+    return rows
