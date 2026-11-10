@@ -1,91 +1,100 @@
-# ICL-ML：In-Context Learning 示例选择
+# ICL-ML: Demonstration Selection for In-Context Learning
 
-一个小型 class project 框架，分两部分：
+A small class-project framework with two parts:
 
-1. **分析**：示例的数量、标签、顺序分别对 ICL 有多大影响？
-2. **方法**：让 LLM 按一份"规则"为每个 query 挑选示例，并用反馈循环自动改进这份规则；学到的规则直接用在没见过的任务上。
+1. **Analysis**: how much do the number, labels and order of demonstrations affect in-context learning (ICL)?
+2. **Method**: an LLM picks demonstrations for each query by following a set of natural-language *rules*, and a feedback loop automatically improves those rules. The learned rules are then applied, frozen, to unseen tasks.
 
-所有实验只需推理，默认全部使用同一个模型（Qwen3.5-2B），单卡即可完成。
+Everything is inference only. By default a single model (Qwen3.5-2B) plays every role, so one GPU is enough.
 
-## 快速开始
+## Quick start
 
 ```bash
 pip install -r requirements.txt
 
-# 先做冒烟测试：小规模、单独的输出目录，几分钟跑完
+# Smoke test first: small scale, separate output folder, finishes in minutes
 OUT=runs/smoke N_TEST=50 ROUNDS=2 DEV=50 bash scripts/run_all.sh
 
-# 正式运行
+# Full run
 bash scripts/run_all.sh
 ```
 
-结果全部写到 `runs/main/` 下：
+All outputs go under `runs/main/`:
 
 ```
-runs/main/results/<exp>/<task>/<model>/summary.csv   每个实验条件一行
-runs/main/rule_opt/best_rules.txt                     学到的规则
-runs/main/rule_opt/log.jsonl                          每一轮的规则、分数和 optimizer 的原始回复
-runs/main/figures/*.png, tables.md                    图和表
+runs/main/results/<exp>/<task>/<model>/summary.csv   one row per experimental condition
+runs/main/rule_opt/best_rules.txt                     the learned rules
+runs/main/rule_opt/log.jsonl                          rules, score and raw optimizer reply for every round
+runs/main/figures/*.png, tables.md                    figures and tables
 ```
 
-可以通过环境变量修改的参数：`MODEL`（目标模型，同时也是选择器）、`OPTIMIZER`（写规则的模型，用更大的模型效果通常更好，例如 `OPTIMIZER=Qwen/Qwen3.5-9B`）、`N_TEST`、`ROUNDS`、`DEV`、`BS`（batch size）、`OUT`。
+Settings you can change through environment variables:
 
-## 数据集
+- `MODEL`: target model, also used as the selector
+- `OPTIMIZER`: the model that writes the rules. A larger model usually writes better rules, e.g. `OPTIMIZER=Qwen/Qwen3.5-9B`
+- `N_TEST`, `ROUNDS`, `DEV`, `BS` (batch size), `OUT`
 
-只用文本短、标签少的分类任务，跑得快：
+## Datasets
 
-| 任务 | 标签数 | 用途 |
+Only short-text classification tasks with few labels, so everything runs fast:
+
+| Task | Labels | Used for |
 |---|---|---|
-| `sst2`（电影评论情感） | 2 | 分析 + meta-train |
-| `ag_news`（新闻主题） | 4 | meta-train |
-| `trec`（问题类型） | 6 | 分析 + meta-train |
-| `cr`（商品评论情感） | 2 | meta-test |
-| `subj`（主观 / 客观） | 2 | meta-test |
-| `emotion`（情绪） | 6 | meta-test |
+| `sst2` (movie review sentiment) | 2 | analysis + meta-train |
+| `ag_news` (news topic) | 4 | meta-train |
+| `trec` (question type) | 6 | analysis + meta-train |
+| `cr` (product review sentiment) | 2 | meta-test |
+| `subj` (subjective / objective) | 2 | meta-test |
+| `emotion` (emotion) | 6 | meta-test |
 
-数据从 HuggingFace 自动下载。每个任务会依次尝试几个镜像，并且**按标签名称**映射到固定的标签顺序，避免镜像之间顺序不同导致标签词对错。数据集 ID 在编写时没有实际下载核对过：如果某个加载失败，报错会列出每个镜像的错误原因，在 `icl/tasks.py` 里改一下路径即可。`synthetic` / `synthetic2` 是本地生成的合成任务，只用于离线测试。
+Datasets are downloaded from HuggingFace automatically. Each task tries several mirrors in turn and maps labels to a fixed order **by label name**, so a mirror with a different label order cannot silently scramble the label words.
 
-## 第一部分：分析实验
+The dataset IDs were not test-downloaded when this code was written. If one fails to load, the error lists the reason for every mirror; fix the path in `icl/tasks.py`.
 
-| `--exp` | 问题 |
+`synthetic` / `synthetic2` are locally generated tasks used only by the offline tests.
+
+## Part 1: Analysis experiments
+
+| `--exp` | Question |
 |---|---|
-| `shots` | 准确率随示例数 k（0–32）如何变化？ |
-| `labels` | 示例标签换成 random / flipped / abstract（foo、bar）后会怎样？flipped 时还会报告模型"跟随翻转标签"的比例（`acc_flip`） |
-| `order` | 同一组示例换 10 种顺序，准确率波动有多大？和换一组示例相比呢？ |
-| `template` | 换 prompt 模板会怎样？（`run_all.sh` 默认不跑） |
+| `shots` | How does accuracy change with the number of demonstrations k (0–32)? |
+| `labels` | What happens when demo labels are random, flipped, or abstract (foo, bar)? For flipped labels we also report how often the model follows the flipped mapping (`acc_flip`). |
+| `order` | How much does accuracy vary across 10 orderings of the same demos, compared with switching to a different demo set? |
+| `template` | What happens when the prompt template changes? (not run by `run_all.sh`) |
 
-分类通过比较每个标签词的 log-prob 得到预测，不需要解析输出。所有条件都在同一批固定的测试样本上评估。每次运行还会额外报告两种校准后的准确率：`acc_cal`（contextual calibration）和 `acc_bc`（batch calibration）。
+Predictions come from comparing the log-probability of each label word, so no output parsing is needed. Every condition is evaluated on the same fixed test examples. Each run also reports two calibrated accuracies: `acc_cal` (contextual calibration) and `acc_bc` (batch calibration).
 
-## 第二部分：方法
+## Part 2: Method
 
-**按 query 选示例，分两步：**
-1. 用句向量模型检索出和 query 最相似的 20 条训练样本作为候选。
-2. 选择器 LLM 逐条判断："按照这些规则，这条候选适合作为这个 query 的示例吗？"，取回答 Yes 的概率作为分数，并与相似度加权融合，最后取分数最高的 8 条。
+**Per-query selection in two steps:**
 
-**学习规则**（`scripts/optimize_rules.py`）：在 meta-train 任务上，每一轮：
+1. A sentence-embedding model retrieves the 20 training examples most similar to the query as candidates.
+2. The selector LLM judges each candidate separately: "According to these rules, is this candidate a good demonstration for the query?" The probability of answering Yes is the candidate's score. It is combined with the retrieval similarity, and the 8 top-scoring candidates are used.
 
-1. 用当前规则为 dev query 选择示例（dev 集从训练集中划出，不使用测试集）；
-2. 用目标模型在 dev 上评估，分数定义为"相对 kNN 的准确率提升"；
-3. 把历史规则及其分数、诊断信息（输赢案例、所选示例的统计、模型的预测分布）交给 optimizer，由它改写规则；
-4. 分数更高就接受新规则。
+**Learning the rules** (`scripts/optimize_rules.py`). On the meta-train tasks, each round:
 
-最后把学到的规则**冻结**，在没见过的 meta-test 任务上评估。
+1. selects demos for the dev queries with the current rules. The dev set is carved out of the training split; the test set is never used;
+2. evaluates the target model on the dev set. The score is the accuracy gain over kNN;
+3. gives the optimizer the past rules with their scores plus diagnostics (wins and losses against kNN, statistics of the chosen demos, the model's prediction distribution), and the optimizer rewrites the rules;
+4. keeps the new rules if they score higher.
 
-**比较的方法：**
+At the end, the learned rules are **frozen** and evaluated on the unseen meta-test tasks.
 
-| 方法 | 作用 |
+**Methods compared:**
+
+| Method | Purpose |
 |---|---|
-| `random` | 随机选 |
-| `knn` | 取最相似的 k 条，是**最关键的 baseline** |
-| `topm_random` | 从 top-20 中随机取，用来排除"只是候选池更好"这一解释 |
-| `llm_norules` | 选择器不给规则 |
-| `llm_human` | 人写的规则（也是规则优化的初始值） |
-| `llm_learned` | 学到的规则，即**我们的方法** |
-| `llm_learned_adaptive` | 当 kNN 选出的邻居标签完全一致时直接用 kNN，省去 LLM 调用（`llm_frac` 记录调用 LLM 的比例） |
+| `random` | random selection |
+| `knn` | the k most similar examples; **the key baseline** |
+| `topm_random` | k random examples from the top 20; rules out "the candidate pool is simply better" |
+| `llm_norules` | selector without rules |
+| `llm_human` | hand-written rules (also the starting point of rule optimization) |
+| `llm_learned` | learned rules; **our method** |
+| `llm_learned_adaptive` | uses kNN directly when the retrieved neighbours all share one label, skipping the LLM (`llm_frac` records how often the LLM is called) |
 
-main table 只看 order seed 0 的结果（`method_acc.png`、`tables.md`）；`method_orders_acc.png` 展示每个方法在 5 种示例顺序下的结果，用来说明结论不依赖顺序。规则优化的过程见 `rule_opt_curve.png`。
+The main table uses demo order seed 0 only (`method_acc.png`, `tables.md`). `method_orders_acc.png` shows every method under 5 demo orders, to show that the conclusions do not depend on the order. `rule_opt_curve.png` shows the rule-optimization progress.
 
-## 单独运行某一步
+## Running individual steps
 
 ```bash
 python scripts/run_experiment.py --model Qwen/Qwen3.5-2B --task sst2 trec --exp shots
@@ -95,24 +104,24 @@ python scripts/run_experiment.py --model Qwen/Qwen3.5-2B --task cr subj emotion 
 python scripts/plot_results.py --results results --out figures
 ```
 
-optimizer 也可以用 API：`--optimizer-backend api --optimizer <模型名> --base-url ...`（需要设置 `OPENAI_API_KEY`）。
+The optimizer can also be an API model: `--optimizer-backend api --optimizer <model name> --base-url ...` (requires `OPENAI_API_KEY`).
 
-## 代码结构
+## Code layout
 
 ```
-icl/tasks.py       数据集和模板
-icl/prompts.py     示例抽样、标签操控、prompt 构造
-icl/models.py      HFModel（label 打分 + chat 生成）、APIModel（仅用于 optimizer）
-icl/runner.py      分析实验 + 方法比较的评估循环，结果写入 summary.csv（支持断点续跑）
-icl/retrieval.py   句向量检索
-icl/selection.py   各种选择器
-icl/rule_opt.py    规则优化循环
+icl/tasks.py       datasets and templates
+icl/prompts.py     demo sampling, label manipulation, prompt construction
+icl/models.py      HFModel (label scoring + chat generation), APIModel (optimizer only)
+icl/runner.py      evaluation loops for the analysis and method experiments; writes summary.csv (resumable)
+icl/retrieval.py   sentence-embedding retrieval
+icl/selection.py   selectors
+icl/rule_opt.py    rule optimization loop
 scripts/           run_all.sh / run_experiment.py / optimize_rules.py / plot_results.py
-tests/             离线测试（随机初始化的微型 GPT-2，不需要联网）：python -m pytest -q
+tests/             offline tests with a tiny randomly initialized GPT-2, no network needed: python -m pytest -q
 ```
 
-## 注意事项
+## Notes
 
-- 模型 ID 请先在 HuggingFace 上核对。如果 Qwen3.5 是图文多模态的 checkpoint，代码会自动改用对应的类加载，只输入文本；Qwen3.5 需要较新版本的 transformers。
-- 如果 `rule_opt_curve.png` 里每一轮都显示没有生成新规则，打开 `log.jsonl` 看 optimizer 的原始回复：通常是模型没有按 `<rules>...</rules>` 格式输出，这时换一个更大的 `OPTIMIZER` 即可。
-- 选择器每次只看一条候选，所以没法保证一组示例之间的多样性。这一点可以作为局限性写进报告。
+- Check the model ID on HuggingFace first. If Qwen3.5 is published as an image-text (multimodal) checkpoint, the code automatically loads it with the matching class and feeds text only. Qwen3.5 needs a recent version of transformers.
+- If `rule_opt_curve.png` shows that no new rules were produced in any round, open `log.jsonl` and read the optimizer's raw replies. Usually the model did not follow the `<rules>...</rules>` format; switching to a larger `OPTIMIZER` fixes this.
+- The selector looks at one candidate at a time, so it cannot guarantee diversity within a set of demos. This is worth mentioning as a limitation in the report.
